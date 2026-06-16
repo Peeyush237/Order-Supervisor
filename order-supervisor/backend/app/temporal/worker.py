@@ -9,7 +9,12 @@ import logging
 from temporalio.worker import Worker
 
 from app.config import get_settings
-from app.temporal.activities import say_hello
+from app.temporal.activities import (
+    persist_activity,
+    persist_memory_update,
+    persist_run_update,
+    say_hello,
+)
 from app.temporal.client import get_temporal_client
 from app.temporal.workflows import HelloWorkflow
 
@@ -24,7 +29,12 @@ async def main() -> None:
         client,
         task_queue=settings.temporal_task_queue,
         workflows=[HelloWorkflow],
-        activities=[say_hello],
+        activities=[
+            say_hello,
+            persist_activity,
+            persist_run_update,
+            persist_memory_update,
+        ],
     )
     logging.info("Worker started on task queue '%s'", settings.temporal_task_queue)
     await worker.run()

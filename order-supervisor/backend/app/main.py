@@ -5,16 +5,25 @@ Temporal and waits for the result, proving the FastAPI -> Temporal -> Worker
 round trip.
 """
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.db.init_db import init_db
 from app.temporal.client import get_temporal_client
 from app.temporal.workflows import HelloWorkflow
 
-app = FastAPI(title="Order Supervisor API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title="Order Supervisor API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
