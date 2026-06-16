@@ -106,6 +106,9 @@ async def get_supervisor(supervisor_id: str) -> dict[str, Any] | None:
 async def create_run(data: dict[str, Any]) -> dict[str, Any]:
     async with SessionLocal() as s:
         run = Run(
+            # Honor a caller-supplied id so the run's PK matches the value passed
+            # to the workflow (workflow persists activities keyed by this id).
+            **({"id": data["id"]} if data.get("id") else {}),
             supervisor_id=data["supervisor_id"],
             order_id=data["order_id"],
             workflow_id=data["workflow_id"],

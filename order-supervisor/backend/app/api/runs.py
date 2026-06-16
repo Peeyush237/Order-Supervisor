@@ -24,6 +24,7 @@ async def create_run(body: RunCreate) -> dict:
     wf_id = orch.workflow_id_for(run_id)
     run = await repo.create_run(
         {
+            "id": run_id,
             "supervisor_id": body.supervisor_id,
             "order_id": body.order_id,
             "workflow_id": wf_id,
