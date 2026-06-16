@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from app.api import runs, supervisors
 from app.config import get_settings
 from app.db.init_db import init_db
 from app.temporal.client import get_temporal_client
@@ -32,6 +33,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(supervisors.router)
+app.include_router(runs.router)
 
 
 @app.get("/health")
