@@ -11,6 +11,7 @@ from temporalio.worker import Worker
 from app.config import get_settings
 from app.temporal.activities import (
     agent_step,
+    compact_memory,
     execute_business_action,
     generate_final_output,
     persist_activity,
@@ -38,6 +39,7 @@ async def main() -> None:
             persist_run_update,
             persist_memory_update,
             agent_step,
+            compact_memory,
             execute_business_action,
             generate_final_output,
         ],

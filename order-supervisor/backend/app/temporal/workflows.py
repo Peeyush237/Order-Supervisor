@@ -23,6 +23,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from app.temporal.activities import (
         agent_step,
+        compact_memory,
         execute_business_action,
         generate_final_output,
         persist_activity,
@@ -34,7 +35,9 @@ with workflow.unsafe.imports_passed_through():
 
 # Tunables
 CONTINUE_AS_NEW_THRESHOLD = 4000  # history events before we reset history
-MAX_IMPORTANT_EVENTS = 50         # in-memory cap; older ones live in rolling summary
+MAX_IMPORTANT_EVENTS = 50         # hard in-memory cap
+COMPACT_THRESHOLD = 12            # compact when important_events exceeds this
+COMPACT_KEEP_RECENT = 6           # entries kept verbatim after compaction
 MIN_REAL_SLEEP_SECONDS = 1.0
 
 _ACT_RETRY = RetryPolicy(maximum_attempts=5)
@@ -326,6 +329,8 @@ class OrderSupervisorWorkflow:
                 retry_policy=_ACT_RETRY,
             )
 
+        await self._maybe_compact()
+
         guidance = decision.get("wake_guidance")
         if guidance:
             self._wake_on = list(guidance.get("wake_on", []))
@@ -343,6 +348,28 @@ class OrderSupervisorWorkflow:
             {"next_wake_at": self._next_wake_at, "sleep_state": "sleeping"}
         )
         self._turn += 1
+
+    async def _maybe_compact(self) -> None:
+        """Context compaction: fold older important events into the rolling
+        summary once the list grows past the threshold."""
+        if len(self._important_events) <= COMPACT_THRESHOLD:
+            return
+        older = self._important_events[:-COMPACT_KEEP_RECENT]
+        recent = self._important_events[-COMPACT_KEEP_RECENT:]
+        result = await workflow.execute_activity(
+            compact_memory,
+            args=[self._inp.run_id, self._rolling_summary, older],
+            start_to_close_timeout=_DEFAULT_TO,
+            retry_policy=_ACT_RETRY,
+        )
+        self._rolling_summary = result.get("rolling_summary", self._rolling_summary)
+        self._important_events = recent
+        await workflow.execute_activity(
+            persist_memory_update,
+            args=[self._inp.run_id, self._rolling_summary, list(self._important_events)],
+            start_to_close_timeout=_DEFAULT_TO,
+            retry_policy=_ACT_RETRY,
+        )
 
     # ------------------------------------------------------------------ #
     # Completion

@@ -50,6 +50,7 @@ from temporalio.worker import Worker  # noqa: E402
 
 from app.temporal.activities import (  # noqa: E402
     agent_step,
+    compact_memory,
     execute_business_action,
     generate_final_output,
     persist_activity,
@@ -76,7 +77,7 @@ async def main():
             workflows=[HelloWorkflow, OrderSupervisorWorkflow],
             activities=[
                 say_hello, persist_activity, persist_run_update, persist_memory_update,
-                agent_step, execute_business_action, generate_final_output,
+                agent_step, compact_memory, execute_business_action, generate_final_output,
             ],
         ):
             run_id = "run-test-1"

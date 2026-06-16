@@ -13,10 +13,14 @@ The agent_step / final_output stubs let the whole workflow run end-to-end now;
 Phase 3/6 swap the LLM in behind the same activity signatures, so the workflow
 code does not change.
 """
+import json
 from typing import Any
 
 from temporalio import activity
 
+from app.agent import prompts
+from app.agent.llm_client import complete_json
+from app.agent.schemas import parse_decision
 from app.constants import BUSINESS_ACTIONS
 from app.db import repo
 
@@ -57,67 +61,17 @@ async def persist_memory_update(
 # --------------------------------------------------------------------------- #
 @activity.defn
 async def agent_step(payload: dict[str, Any]) -> dict[str, Any]:
-    """STUB agent inference (Phase 2).
-
-    Returns a deterministic AgentDecision-shaped dict so the workflow can be
-    exercised end-to-end without an LLM. Phase 3 replaces the body with a real
-    structured LLM call behind this same signature.
-    """
-    trigger = payload.get("trigger", "unknown")
-    order_id = payload.get("order_id", "?")
+    """One structured LLM inference. The LLM only *proposes*; the workflow
+    executes and owns control flow. Output is validated against a strict schema
+    with a safe fallback (see app.agent.schemas)."""
     default_wake_hours = float(payload.get("default_wake_hours", 6.0))
-    events = payload.get("pending_events", [])
-    instructions = payload.get("pending_instructions", [])
-
-    actions: list[dict[str, Any]] = []
-    reasoning_bits = [f"[stub] trigger={trigger}"]
-
-    if trigger == "start":
-        actions.append(
-            {
-                "name": "create_internal_note",
-                "args": {"note": f"Supervisor started watching order {order_id}."},
-            }
-        )
-        reasoning_bits.append("Opened supervision; recorded a starting note.")
-
-    for ev in events:
-        etype = ev.get("type")
-        reasoning_bits.append(f"saw event '{etype}'")
-        if etype == "payment_failed":
-            actions.append(
-                {
-                    "name": "message_payments_team",
-                    "args": {"message": f"Payment failed for order {order_id}; please investigate."},
-                }
-            )
-        elif etype == "shipment_delayed":
-            actions.append(
-                {
-                    "name": "message_customer",
-                    "args": {"message": "Your shipment is delayed; we're on it and will update you."},
-                }
-            )
-        elif etype == "refund_requested":
-            actions.append(
-                {
-                    "name": "message_fulfillment_team",
-                    "args": {"message": f"Refund requested on order {order_id}; please review."},
-                }
-            )
-
-    for ins in instructions:
-        reasoning_bits.append(f"noted instruction: {ins}")
-
-    return {
-        "reasoning": "; ".join(reasoning_bits),
-        "actions": actions,
-        "memory_update": None,
-        "important_event": (events[-1].get("type") if events else None),
-        "next_wake_seconds": int(default_wake_hours * 3600),
-        "wake_guidance": None,
-        "recommend_completion": False,
-    }
+    system, user = prompts.build_agent_messages(payload)
+    raw = await complete_json(system, user, payload)
+    decision = parse_decision(raw, default_wake_hours=default_wake_hours)
+    activity.logger.info(
+        "agent_step trigger=%s actions=%d", payload.get("trigger"), len(decision["actions"])
+    )
+    return decision
 
 
 @activity.defn
@@ -136,6 +90,32 @@ async def execute_business_action(
     result = {"action": name, "args": args, "status": "recorded"}
     await repo.add_activity(run_id, "action", result)
     return result
+
+
+@activity.defn
+async def compact_memory(
+    run_id: str, rolling_summary: str, older_events: list[str]
+) -> dict[str, Any]:
+    """Fold older timeline events into the rolling summary (context compaction).
+
+    Returns {"rolling_summary": str}. Falls back to a naive concatenation if the
+    LLM output can't be parsed, so the workflow always gets a usable summary.
+    """
+    system, user = prompts.build_compaction_messages(rolling_summary, older_events)
+    raw = await complete_json(system, user, {"compaction": True})
+    new_summary = rolling_summary
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and isinstance(data.get("rolling_summary"), str):
+            new_summary = data["rolling_summary"]
+    except (json.JSONDecodeError, TypeError):
+        joined = "; ".join(older_events)
+        new_summary = (rolling_summary + " | " + joined).strip(" |")
+
+    await repo.update_memory(run_id, rolling_summary=new_summary)
+    await repo.add_activity(run_id, "lifecycle", {"event": "memory_compacted",
+                                                  "folded": len(older_events)})
+    return {"rolling_summary": new_summary}
 
 
 @activity.defn
