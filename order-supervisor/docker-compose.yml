@@ -1,0 +1,82 @@
+version: "3.8"
+
+# Order Supervisor — local infrastructure
+# Brings up: Postgres (Temporal's own DB), Postgres (our app DB),
+# the Temporal server, and the Temporal Web UI.
+#
+# The FastAPI backend and Next.js frontend are run on the host (see README),
+# not in compose, to keep the dev loop fast.
+
+services:
+  # --- Temporal's internal persistence ---
+  temporal-postgres:
+    image: postgres:16-alpine
+    container_name: os-temporal-postgres
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- Our application database ---
+  app-postgres:
+    image: postgres:16-alpine
+    container_name: os-app-postgres
+    environment:
+      POSTGRES_USER: supervisor
+      POSTGRES_PASSWORD: supervisor
+      POSTGRES_DB: order_supervisor
+    volumes:
+      - app-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supervisor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- Temporal server (auto-setup: creates namespaces/schema on first boot) ---
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    container_name: os-temporal
+    depends_on:
+      temporal-postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=temporal-postgres
+    ports:
+      - "7233:7233"
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # --- Temporal Web UI ---
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    container_name: os-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8080:8080"
+
+volumes:
+  temporal-pgdata:
+  app-pgdata:

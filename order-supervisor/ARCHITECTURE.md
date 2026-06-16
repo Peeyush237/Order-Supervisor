@@ -1,0 +1,58 @@
+# Architecture
+
+## Overview
+
+One **Temporal workflow run per order** (`OrderSupervisorWorkflow`). The workflow
+is the orchestrator and owns all control flow; the LLM only *proposes* actions.
+
+```
+                  signals                       activities (side effects)
+  FastAPI ───────────────────────▶  Temporal  ───────────────────────▶  Postgres
+ (REST API)   submit_event          Workflow      agent_step (LLM)        (UI source
+              add_instruction      (deterministic, classify_event         of truth)
+              set_paused            drain-loop,    business actions ×5
+              request_completion    wait_condition compact_memory
+                  ▲                  sleep/wake)   final_output
+                  │ queries (live state)
+  Next.js UI ─────┘ + reads Postgres for lists/timeline/memory
+```
+
+## Key design decisions
+
+1. **Deterministic workflow.** No LLM/DB/`datetime.now()`/`random`/network/env
+   inside the workflow. Time via `workflow.now()`; all side effects in activities.
+2. **Agent is an activity, not a loop.** `agent_step` does one structured LLM
+   inference returning JSON: `{reasoning, actions[], memory_update, next_wake_seconds, recommend_completion}`.
+   The workflow executes the proposed business-action activities, persists, sets
+   the next wake-up, and sleeps.
+3. **Three inference triggers:** workflow start, important signal, scheduled wake-up.
+4. **Sleep/wake** via `workflow.wait_condition(..., timeout=next_wake)`. Timeout
+   with no pending work = the scheduled wake-up (also models `no_update_for_n_hours`).
+5. **Signals enqueue; the loop drains.** `submit_event`, `add_instruction`,
+   `set_paused`, `request_completion`. Queries expose live state.
+6. **Lightweight classifier** (separate from the main agent) decides whether an
+   event is important enough to wake the agent now vs. defer to next scheduled wake.
+7. **Persistence is the UI's source of truth.** Activities write timeline,
+   activity log, memory, status, final output. API reads Postgres + Temporal queries.
+8. **`continue_as_new`** when history grows large, carrying compacted memory +
+   current order state.
+9. **Workflow-owned completion.** The agent may *recommend* completion, but a run
+   only ends on workflow rules: terminal order event, manual termination, or max age.
+
+## Data model (single activity-log approach)
+
+- `supervisors` — config templates (name, base_instruction, available_actions, …).
+- `runs` — one per order (status, order_context, next_wake_at, sleep_state, final_output).
+- `run_memory` — rolling_summary + important_events.
+- `activity_log` — append-only: `kind` ∈ {event, wake_decision, sleep_decision,
+  agent_reasoning, action, instruction, final_output}.
+
+## Phasing
+
+- **Phase 0** ✅ scaffold + Hello round trip
+- Phase 1 — DB & persistence layer
+- Phase 2 — Temporal core (signals, drain-loop, wait_condition, queries, completion rules, continue_as_new)
+- Phase 3 — Agent runtime (agent_step, classifier, 5 business actions, memory compaction)
+- Phase 4 — FastAPI endpoints
+- Phase 5 — Frontend
+- Phase 6 — End-of-run output, docs, demo script
