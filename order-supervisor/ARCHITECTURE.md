@@ -47,12 +47,46 @@ is the orchestrator and owns all control flow; the LLM only *proposes* actions.
 - `activity_log` — append-only: `kind` ∈ {event, wake_decision, sleep_decision,
   agent_reasoning, action, instruction, final_output}.
 
-## Phasing
+## Triggers & control flow
 
-- **Phase 0** ✅ scaffold + Hello round trip
-- Phase 1 — DB & persistence layer
-- Phase 2 — Temporal core (signals, drain-loop, wait_condition, queries, completion rules, continue_as_new)
-- Phase 3 — Agent runtime (agent_step, classifier, 5 business actions, memory compaction)
-- Phase 4 — FastAPI endpoints
-- Phase 5 — Frontend
-- Phase 6 — End-of-run output, docs, demo script
+The agent runs on exactly three triggers, then sleeps:
+1. **workflow start** — initial inference with order context + base instruction.
+2. **important signal** — an event the classifier rates high-priority, or any
+   run instruction (treated as an interrupt → immediate inference).
+3. **scheduled wake-up** — the `wait_condition` timeout fires with no pending work.
+
+Low-priority events are logged and deferred; the workflow re-sleeps for the
+*remaining* time until the existing wake deadline (the timer isn't reset).
+
+## Wake/sleep classifier
+
+Deterministic, in-workflow (so it stays replay-safe), separate from the agent:
+- terminal events and unknown events → always wake (unknown-event escalation);
+- agent-emitted `wake_guidance.wake_on` → wake;
+- otherwise by `wake_aggressiveness`: `aggressive` wakes on all, `balanced` wakes
+  on the high-priority set, `conservative` only on payment/refund failures.
+
+Every wake/sleep decision is written to the activity log.
+
+## Memory & compaction
+
+A rolling summary + a capped list of important events. When the list exceeds a
+threshold, `compact_memory` (LLM) folds the older entries into the rolling
+summary and keeps the most recent few verbatim.
+
+## Phasing (all complete)
+
+- **Phase 0** — scaffold + Hello round trip
+- **Phase 1** — DB & persistence layer (single `activity_log`)
+- **Phase 2** — Temporal core (signals, drain-loop, wait_condition, queries, workflow-owned completion, continue_as_new hook)
+- **Phase 3** — Agent runtime (pluggable LLM, strict decision schema + fallback, classifier, 5 business actions, memory compaction)
+- **Phase 4** — FastAPI endpoints
+- **Phase 5** — Next.js frontend
+- **Phase 6** — LLM end-of-run output, docs, seeded demo script
+
+## Testing
+
+`scripts/test_workflow.py` runs the real workflow against Temporal's
+time-skipping test server with the DB mocked in-memory, asserting start/
+signal/scheduled-wake triggers, low-vs-high-priority classification, pause/
+resume, and workflow-owned terminal completion — no Docker/Postgres/LLM needed.

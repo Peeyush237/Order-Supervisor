@@ -92,6 +92,18 @@ async def _anthropic(settings, system: str, user: str) -> str:
 # Mock provider: deterministic policy so the product runs with no API key.
 # --------------------------------------------------------------------------- #
 def _mock_decision_json(context: dict[str, Any]) -> str:
+    # Compaction request
+    if context.get("compaction"):
+        return json.dumps({"rolling_summary": "[mock] older events folded into summary."})
+    # Final-output request
+    if context.get("final_output"):
+        return json.dumps({
+            "summary": "[mock] Order supervised to completion; issues handled as they arose.",
+            "important_actions": ["Notified relevant teams", "Kept the customer informed"],
+            "key_learnings": ["Payment and shipment events drove most interventions."],
+            "recommendations": ["Watch payment_failed early; pre-empt shipment delays."],
+        })
+
     trigger = context.get("trigger", "unknown")
     order_id = context.get("order_id", "?")
     default_wake_hours = float(context.get("default_wake_hours", 6.0))
