@@ -27,8 +27,12 @@ class WorkflowInput:
     # Demo time scaling: real_sleep_seconds = sim_seconds * time_scale / 3600.
     # time_scale = "real seconds per simulated hour". 1.0 => 1 sim-hour == 1 real sec.
     time_scale: float = 1.0
-    # Workflow-owned max age (in simulated hours) after which the run completes.
+    # Workflow-owned max age (in simulated hours) after which an UNDELIVERED run
+    # is escalated + auto-refunded and ends as "expired".
     max_age_hours: float = 720.0
+    # After `delivered`, the run stays open this many simulated hours to handle
+    # returns/refunds, then completes ("return_window_closed").
+    return_window_hours: float = 168.0  # 7 days
     # Populated only by continue_as_new to resume state across history resets.
     carryover: dict[str, Any] | None = None
 

@@ -48,7 +48,8 @@ ACTIVITY_KINDS = (
 )
 
 # --- Run statuses (workflow-owned) ---
-RUN_STATUSES = ("active", "paused", "completed", "terminated")
+# expired = ended on max age without delivery (escalated + auto-refunded)
+RUN_STATUSES = ("active", "paused", "completed", "terminated", "expired")
 
 
 class Supervisor(Base):

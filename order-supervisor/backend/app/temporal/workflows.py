@@ -67,7 +67,12 @@ class OrderSupervisorWorkflow:
         self._paused: bool = False
         self._terminate_requested: bool = False
         self._terminate_reason: str = ""
-        self._terminal_event_received: bool = False
+        # delivery / post-delivery return window
+        self._delivered: bool = False
+        self._post_delivery_deadline: datetime | None = None
+        # decided in the loop, consumed by _finalize
+        self._end_reason: str = ""
+        self._end_status: str = ""
         # --- live state (exposed via query) ---
         self._status: str = "active"
         self._sleep_state: str = "awake"
@@ -122,6 +127,12 @@ class OrderSupervisorWorkflow:
             "turn": self._turn,
             "recommend_completion": self._recommend_completion,
             "wake_guidance": {"wake_on": self._wake_on, "note": self._wake_note},
+            "delivered": self._delivered,
+            "return_window_until": (
+                self._post_delivery_deadline.isoformat()
+                if self._post_delivery_deadline
+                else None
+            ),
         }
 
     # ------------------------------------------------------------------ #
@@ -141,9 +152,9 @@ class OrderSupervisorWorkflow:
 
         # --- main supervise loop ---
         while True:
-            if self._terminate_requested:
-                break
-            if self._terminal_event_received or self._is_past_max_age():
+            decision = self._completion_decision()
+            if decision:
+                self._end_reason, self._end_status = decision
                 break
 
             if self._paused:
@@ -152,13 +163,17 @@ class OrderSupervisorWorkflow:
                     lambda: (not self._paused) or self._terminate_requested
                 )
                 if self._terminate_requested:
-                    break
+                    continue
                 await self._set_status("active")
                 continue
 
             timed_out = await self._sleep_until_wake()
 
             if self._terminate_requested or self._paused:
+                continue
+            # If a completion condition just became true (e.g. window/age elapsed),
+            # let the loop top handle it rather than running a pointless agent step.
+            if self._completion_decision():
                 continue
             if timed_out:
                 await self._run_agent("scheduled_wake")
@@ -195,10 +210,26 @@ class OrderSupervisorWorkflow:
             return True
 
     def _remaining_timeout(self) -> timedelta | None:
-        if self._wake_deadline is None:
+        deadline = self._effective_deadline()
+        if deadline is None:
             return None  # sleep until a signal arrives
-        remaining = (self._wake_deadline - workflow.now()).total_seconds()
+        remaining = (deadline - workflow.now()).total_seconds()
         return timedelta(seconds=max(0.0, remaining))
+
+    def _effective_deadline(self) -> datetime | None:
+        """Soonest moment the loop must wake: the agent's next wake-up, plus the
+        governing lifecycle deadline (return window if delivered, else max age)."""
+        candidates: list[datetime] = []
+        if self._wake_deadline is not None:
+            candidates.append(self._wake_deadline)
+        if self._delivered and self._post_delivery_deadline is not None:
+            candidates.append(self._post_delivery_deadline)
+        elif not self._delivered and self._started_at is not None:
+            candidates.append(
+                self._started_at
+                + timedelta(seconds=self._inp.max_age_hours * self._inp.time_scale)
+            )
+        return min(candidates) if candidates else None
 
     def _set_next_wake(self, sim_seconds: int | None) -> None:
         if sim_seconds is None:
@@ -230,8 +261,8 @@ class OrderSupervisorWorkflow:
             await self._persist(
                 "event", {"type": etype, "data": ev.get("data", {}), "priority": "high" if high else "low"}
             )
-            if etype in TERMINAL_EVENTS:
-                self._terminal_event_received = True
+            if etype == "delivered" and not self._delivered:
+                self._open_return_window()
             if high:
                 wake_now = True
                 important.append(ev)
@@ -307,12 +338,7 @@ class OrderSupervisorWorkflow:
         )
 
         for action in decision.get("actions", []):
-            await workflow.execute_activity(
-                execute_business_action,
-                args=[self._inp.run_id, action.get("name", ""), action.get("args", {})],
-                start_to_close_timeout=_DEFAULT_TO,
-                retry_policy=_ACT_RETRY,
-            )
+            await self._action(action.get("name", ""), action.get("args", {}))
 
         mem_update = decision.get("memory_update")
         imp = decision.get("important_event")
@@ -372,21 +398,80 @@ class OrderSupervisorWorkflow:
         )
 
     # ------------------------------------------------------------------ #
-    # Completion
+    # Completion (workflow-owned)
     # ------------------------------------------------------------------ #
+    def _open_return_window(self) -> None:
+        """`delivered` arrived: keep the run alive to handle returns/refunds."""
+        self._delivered = True
+        secs = self._inp.return_window_hours * self._inp.time_scale
+        self._post_delivery_deadline = workflow.now() + timedelta(seconds=secs)
+
     def _is_past_max_age(self) -> bool:
         if self._started_at is None:
             return False
         max_real = self._inp.max_age_hours * self._inp.time_scale
         return (workflow.now() - self._started_at).total_seconds() >= max_real
 
-    async def _finalize(self) -> None:
+    def _completion_decision(self) -> tuple[str, str] | None:
+        """Return (reason, status) if the run should end now, else None.
+        Delivered and undelivered runs are governed by separate rules so they
+        never clash."""
         if self._terminate_requested:
-            reason, status = (self._terminate_reason or "terminated"), "terminated"
-        elif self._terminal_event_received:
-            reason, status = "terminal_event", "completed"
-        else:
-            reason, status = "max_age_reached", "completed"
+            return (self._terminate_reason or "manual_termination", "terminated")
+        if self._delivered:
+            # Governed ONLY by the return/refund window (max-age can't kill it).
+            if (
+                self._post_delivery_deadline is not None
+                and workflow.now() >= self._post_delivery_deadline
+            ):
+                return ("return_window_closed", "completed")
+            return None
+        # Undelivered: governed ONLY by max age -> escalate + auto-refund.
+        if self._is_past_max_age():
+            return ("expired_undelivered", "expired")
+        return None
+
+    async def _escalate_and_refund_undelivered(self) -> None:
+        """Final handling when a run expires without delivery: hand off to a human
+        and auto-initiate a refund, recorded in activities + memory."""
+        oid = self._inp.order_id
+        hours = self._inp.max_age_hours
+        span = f"~{int(hours / 24)} days" if hours >= 24 else f"~{int(hours)} hours"
+        await self._action(
+            "message_fulfillment_team",
+            {"message": f"Order {oid} stalled {span} with no delivery — needs human review."},
+        )
+        await self._action(
+            "create_internal_note",
+            {"note": f"Order {oid} not delivered within the max supervision window. "
+                     f"Auto-refund initiated; customer notified."},
+        )
+        await self._action(
+            "message_customer",
+            {"message": "Unfortunately your order could not be delivered in time. "
+                        "We have initiated a full refund, which will be completed "
+                        "within 7 working days."},
+        )
+        note = "Auto-refund initiated due to non-delivery; customer notified (7 working days)."
+        self._important_events.append(note)
+        self._important_events = self._important_events[-MAX_IMPORTANT_EVENTS:]
+        self._rolling_summary = (self._rolling_summary + " | " + note).strip(" |")
+        await workflow.execute_activity(
+            persist_memory_update,
+            args=[self._inp.run_id, self._rolling_summary, list(self._important_events)],
+            start_to_close_timeout=_DEFAULT_TO,
+            retry_policy=_ACT_RETRY,
+        )
+        await self._persist(
+            "lifecycle", {"event": "auto_refund_initiated", "reason": "non_delivery"}
+        )
+
+    async def _finalize(self) -> None:
+        reason = self._end_reason or "completed"
+        status = self._end_status or "completed"
+
+        if status == "expired":
+            await self._escalate_and_refund_undelivered()
 
         final = await workflow.execute_activity(
             generate_final_output,
@@ -423,6 +508,7 @@ class OrderSupervisorWorkflow:
             order_context=self._inp.order_context,
             time_scale=self._inp.time_scale,
             max_age_hours=self._inp.max_age_hours,
+            return_window_hours=self._inp.return_window_hours,
             carryover={
                 "started_at": self._started_at.isoformat() if self._started_at else None,
                 "rolling_summary": self._rolling_summary,
@@ -432,6 +518,12 @@ class OrderSupervisorWorkflow:
                 "wake_deadline": self._wake_deadline.isoformat() if self._wake_deadline else None,
                 "turn": self._turn,
                 "recommend_completion": self._recommend_completion,
+                "delivered": self._delivered,
+                "post_delivery_deadline": (
+                    self._post_delivery_deadline.isoformat()
+                    if self._post_delivery_deadline
+                    else None
+                ),
             },
         )
         return new
@@ -446,6 +538,9 @@ class OrderSupervisorWorkflow:
         self._wake_note = c.get("wake_note", "")
         self._turn = c.get("turn", 0)
         self._recommend_completion = c.get("recommend_completion", False)
+        self._delivered = c.get("delivered", False)
+        if c.get("post_delivery_deadline"):
+            self._post_delivery_deadline = datetime.fromisoformat(c["post_delivery_deadline"])
         if c.get("wake_deadline"):
             self._wake_deadline = datetime.fromisoformat(c["wake_deadline"])
             self._next_wake_at = c["wake_deadline"]
@@ -454,6 +549,15 @@ class OrderSupervisorWorkflow:
     # ------------------------------------------------------------------ #
     # Persistence helpers (always via activities)
     # ------------------------------------------------------------------ #
+    async def _action(self, name: str, args: dict) -> None:
+        """Execute one business action (records an activity entry)."""
+        await workflow.execute_activity(
+            execute_business_action,
+            args=[self._inp.run_id, name, args],
+            start_to_close_timeout=_DEFAULT_TO,
+            retry_policy=_ACT_RETRY,
+        )
+
     async def _persist(self, kind: str, payload: dict) -> None:
         await workflow.execute_activity(
             persist_activity,

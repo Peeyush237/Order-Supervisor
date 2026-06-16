@@ -6,6 +6,7 @@ const STATUS_STYLES: Record<string, string> = {
   paused: "bg-amber-100 text-amber-800",
   completed: "bg-blue-100 text-blue-800",
   terminated: "bg-rose-100 text-rose-800",
+  expired: "bg-orange-100 text-orange-800",
 };
 
 const KIND_STYLES: Record<string, string> = {

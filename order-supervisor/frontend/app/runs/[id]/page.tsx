@@ -54,7 +54,10 @@ export default function RunDetailPage() {
 
   const { run, memory, activities, live_state } = detail;
   const live = (live_state || {}) as Record<string, any>;
-  const terminal = run.status === "completed" || run.status === "terminated";
+  const terminal =
+    run.status === "completed" ||
+    run.status === "terminated" ||
+    run.status === "expired";
 
   return (
     <main className="space-y-5">
@@ -82,6 +85,18 @@ export default function RunDetailPage() {
         <p className="mt-2 font-mono text-xs text-slate-400">
           workflow: {run.workflow_id}
         </p>
+        {!terminal && live.delivered && live.return_window_until && (
+          <div className="mt-3 rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+            ✅ Delivered — return/refund window open until{" "}
+            <b>{fmtTime(live.return_window_until)}</b>. Refund requests are still handled.
+          </div>
+        )}
+        {run.status === "expired" && (
+          <div className="mt-3 rounded bg-orange-50 px-3 py-2 text-sm text-orange-800">
+            ⚠️ Expired without delivery — escalated to the fulfillment team and a refund
+            was auto-initiated (see activity log & memory).
+          </div>
+        )}
       </section>
 
       {/* Controls */}

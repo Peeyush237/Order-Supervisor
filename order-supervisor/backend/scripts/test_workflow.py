@@ -154,16 +154,49 @@ async def main():
             assert st["turn"] > t3, ("scheduled wake should advance turn", st)
             print("scheduled wake ok; turn now", st["turn"])
 
-            # 6) terminal event -> workflow-owned completion
+            # 6) delivered -> opens a return/refund window, does NOT end the run
             await handle.signal(OrderSupervisorWorkflow.submit_event,
                                 {"type": "delivered", "data": {}})
+            await asyncio.sleep(0.3)
+            st = await handle.query(OrderSupervisorWorkflow.get_state)
+            assert st["delivered"] and st["return_window_until"], st
+            assert st["status"] == "active", ("still active during return window", st)
+            print("delivered -> return window open; status", st["status"])
+
+            # refund within the window is handled (run still alive)
+            await handle.signal(OrderSupervisorWorkflow.submit_event,
+                                {"type": "refund_requested", "data": {}})
+            await asyncio.sleep(0.3)
+
+            # window closes after return_window_hours (168h * time_scale=1 -> 168s)
+            await env.sleep(timedelta(seconds=180))
             result = await handle.result()
-            print("FINAL OUTPUT:", result["summary"])
-            assert result["reason"] == "terminal_event", result
+            assert result["reason"] == "return_window_closed", result
             assert _RUNS[run_id]["status"] == "completed", _RUNS[run_id]
+            print("return window closed -> completed:", result["summary"][:60])
+
+            # 7) SECOND run: never delivered -> expires -> escalate + auto-refund
+            run2 = "run-test-2"
+            inp2 = WorkflowInput(
+                run_id=run2, order_id="ORDER-STALLED",
+                supervisor=inp.supervisor, order_context={"item": "Lamp"},
+                time_scale=1.0, max_age_hours=2.0,  # 2h * 1 -> ~2s real
+            )
+            h2 = await env.client.start_workflow(
+                OrderSupervisorWorkflow.run, inp2, id=run2, task_queue="test")
+            res2 = await h2.result()
+            assert res2["reason"] == "expired_undelivered", res2
+            assert _RUNS[run2]["status"] == "expired", _RUNS[run2]
+            acts2 = [a["payload"].get("action") for a in _LOG
+                     if a["run_id"] == run2 and a["kind"] == "action"]
+            assert "message_fulfillment_team" in acts2 and "message_customer" in acts2, acts2
+            assert any(a["run_id"] == run2 and a["payload"].get("event") == "auto_refund_initiated"
+                       for a in _LOG), "auto_refund_initiated lifecycle missing"
+            assert "Auto-refund" in _MEM[run2]["rolling_summary"], _MEM[run2]
+            print("expired run escalated + auto-refunded:", acts2)
 
             print("\nactivity_log kinds:", kinds_count())
-            print("ALL PHASE 2 CHECKS PASSED")
+            print("ALL CHECKS PASSED")
 
 
 if __name__ == "__main__":
