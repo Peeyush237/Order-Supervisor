@@ -37,7 +37,28 @@ is the orchestrator and owns all control flow; the LLM only *proposes* actions.
 8. **`continue_as_new`** when history grows large, carrying compacted memory +
    current order state.
 9. **Workflow-owned completion.** The agent may *recommend* completion, but a run
-   only ends on workflow rules: terminal order event, manual termination, or max age.
+   only ends on workflow rules (see "Lifecycle & completion" below).
+
+## Lifecycle & completion (workflow-owned)
+
+Completion is decided by `_completion_decision()` in the workflow, never by the agent.
+Delivered and undelivered orders follow separate rules so they never clash:
+
+- **Delivered → return/refund window.** `delivered` does NOT end the run. It opens a
+  return/refund window (`return_window_hours`, default 7 days). During the window the
+  supervisor still handles refunds, customer messages, etc. The run completes
+  (`return_window_closed`, status `completed`) when the window closes — or earlier on
+  manual termination.
+- **Undelivered → expired.** If an order is never delivered and reaches `max_age_hours`,
+  the workflow escalates to the fulfillment team, auto-refunds the customer (a
+  `message_customer` action + `auto_refund_initiated` lifecycle entry), records it in
+  memory, and ends with status `expired` (reason `expired_undelivered`).
+- **Manual termination.** `request_completion` ends gracefully (runs the final report);
+  the API also supports a hard `client.terminate` fallback.
+
+A delivered run is governed only by the return window (max age can't kill it); an
+undelivered run is governed only by max age. `activity_log.kind` also includes
+`lifecycle` (started, status changes, window opened, auto-refund, etc.).
 
 ## Data model (single activity-log approach)
 
@@ -45,7 +66,7 @@ is the orchestrator and owns all control flow; the LLM only *proposes* actions.
 - `runs` — one per order (status, order_context, next_wake_at, sleep_state, final_output).
 - `run_memory` — rolling_summary + important_events.
 - `activity_log` — append-only: `kind` ∈ {event, wake_decision, sleep_decision,
-  agent_reasoning, action, instruction, final_output}.
+  agent_reasoning, action, instruction, lifecycle, final_output}.
 
 ## Triggers & control flow
 
